@@ -43,13 +43,22 @@ func init() {
 			}
 		}
 		secret = []byte(s)
-		b := NewBroker()
-		k.Realtime = b
-		// Ticket endpoint: the app should mount this behind its auth so only
-		// authenticated users get a ticket for private channels.
-		k.Router.Get("/events/ticket", issueTicket)
+		k.Realtime = NewBroker()
 		return nil
 	})
+}
+
+// MountTicket mounts IssueTicket at /events/ticket wrapped in the middleware you
+// pass — which should be your auth, so only authenticated users get a ticket.
+//
+// The provider deliberately does not do this for you. A provider that mounts a
+// route makes chi's mux "have routes", and any plugin that later calls
+// Router.Use — togo's own auth plugin does, for CORS — then panics with
+// "chi: all middlewares must be defined before routes on a mux". Leaving the
+// mount to the app means this package cannot break another plugin's boot, at
+// any provider priority, in any order.
+func MountTicket(k *togo.Kernel, mw ...func(http.Handler) http.Handler) {
+	k.Router.With(mw...).Get("/events/ticket", IssueTicket)
 }
 
 type client struct {
@@ -172,9 +181,10 @@ func (b *broker) readLoop(ctx context.Context, conn *websocket.Conn, c *client) 
 
 // --- tickets (HMAC-signed, short-lived) ----------------------------------
 
-// issueTicket returns a signed ticket for private-channel access. Mount behind
-// the app's auth middleware so only authenticated users receive one.
-func issueTicket(w http.ResponseWriter, r *http.Request) {
+// IssueTicket returns a signed ticket for private-channel access. Mount it behind
+// the app's auth middleware — see MountTicket — so only authenticated users
+// receive one.
+func IssueTicket(w http.ResponseWriter, r *http.Request) {
 	exp := strconv.FormatInt(time.Now().Add(60*time.Second).Unix(), 10)
 	nonce := randHex()
 	payload := nonce + "." + exp

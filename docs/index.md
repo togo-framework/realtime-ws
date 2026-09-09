@@ -14,6 +14,11 @@ togo install togo-framework/realtime-ws
   a plain event (no `:`) goes to everyone.
 
 ## Tickets (private channels)
-`GET /events/ticket` returns a short-lived HMAC-signed ticket — **mount it behind your
-auth** so only authenticated users get one. The client connects with `/events?ticket=...`;
-a valid ticket unlocks `private-*` subscriptions. Set `REALTIME_SECRET`.
+`GET /events/ticket` returns a short-lived HMAC-signed ticket. **You mount it, behind
+your auth** — `ws.MountTicket(k, authSvc.Middleware)` — so only authenticated users get
+one. The client connects with `/events?ticket=...`; a valid ticket unlocks `private-*`
+subscriptions. Set `REALTIME_SECRET`.
+
+The provider mounts no routes itself: a provider that mounts a route makes chi's mux
+"have routes", and any plugin calling `Router.Use` afterwards (togo's auth plugin does,
+for CORS) panics. Since v0.3.0 the mount is the app's job.
