@@ -1,12 +1,16 @@
 // Package ws is a channel-based WebSocket transport for togo realtime. It supports
 // public and private channels, signed connection tickets (so private channels are
-// authenticated), and channel-scoped broadcasting. It implements togo.Broker and
-// overrides the default SSE broker when installed.
+// authenticated and scoped to the channels the ticket was granted), and
+// channel-scoped broadcasting. It implements togo.Broker and overrides the default
+// SSE broker when installed.
 //
 // Publish uses an event of the form "channel:event" to target a channel (private
-// channels are prefixed "private-"); an event with no ":" broadcasts to everyone.
+// channels are prefixed "private-"); an event with no ":" broadcasts to every
+// connection that presented a valid ticket (unauthenticated connections never see
+// unchanneled broadcasts).
 //
-// Install: `togo install togo-framework/realtime-ws`. Env: REALTIME_SECRET.
+// Install: `togo install togo-framework/realtime-ws`. Env: REALTIME_SECRET,
+// REALTIME_ORIGINS.
 package ws
 
 import (
@@ -15,11 +19,12 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"crypto/subtle"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"log/slog"
 	"net/http"
 	"os"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -29,7 +34,22 @@ import (
 	"github.com/togo-framework/togo"
 )
 
-var secret []byte
+// maxChannelBytes caps channel-name length accepted from clients and grants.
+const maxChannelBytes = 200
+
+// defaultTicketTTL is how long an issued ticket remains valid. Tests may
+// override it via ticketTTL.
+const defaultTicketTTL = 60 * time.Second
+
+var (
+	secret           []byte
+	originPatterns   []string
+	logger           *slog.Logger
+	ticketTTL        = defaultTicketTTL
+	ticketChannelFn  func(r *http.Request) []string
+	ticketFnMu       sync.RWMutex
+	warnUnconfigured sync.Once
+)
 
 func init() {
 	togo.RegisterProviderFunc("realtime-ws", togo.PriorityService+10, func(k *togo.Kernel) error {
@@ -43,6 +63,17 @@ func init() {
 			}
 		}
 		secret = []byte(s)
+		logger = k.Log
+
+		originPatterns = nil
+		if o := os.Getenv("REALTIME_ORIGINS"); o != "" {
+			for _, p := range strings.Split(o, ",") {
+				if p = strings.TrimSpace(p); p != "" {
+					originPatterns = append(originPatterns, p)
+				}
+			}
+		}
+
 		k.Realtime = NewBroker()
 		return nil
 	})
@@ -61,11 +92,26 @@ func MountTicket(k *togo.Kernel, mw ...func(http.Handler) http.Handler) {
 	k.Router.With(mw...).Get("/events/ticket", IssueTicket)
 }
 
+// SetTicketChannels registers the function IssueTicket (and so MountTicket) uses
+// to decide which channels the requesting user's ticket is granted. f is called
+// per request and should return the exact channel names and/or "prefix*" globs
+// the caller may subscribe to (typically their own private-* channels).
+//
+// If this is never called, IssueTicket grants no private channels — secure by
+// default — and logs a one-time warning explaining that SetTicketChannels needs
+// to be configured to unlock private-channel access.
+func SetTicketChannels(f func(r *http.Request) []string) {
+	ticketFnMu.Lock()
+	ticketChannelFn = f
+	ticketFnMu.Unlock()
+}
+
 type client struct {
 	ch       chan string
 	mu       sync.RWMutex
 	channels map[string]struct{}
 	authed   bool
+	grants   []string
 }
 
 func (c *client) subscribed(channel string) bool {
@@ -73,6 +119,21 @@ func (c *client) subscribed(channel string) bool {
 	defer c.mu.RUnlock()
 	_, ok := c.channels[channel]
 	return ok
+}
+
+// granted reports whether the client's ticket grants access to channel, either
+// via an exact match or a "prefix*" glob.
+func (c *client) granted(channel string) bool {
+	for _, g := range c.grants {
+		if strings.HasSuffix(g, "*") {
+			if strings.HasPrefix(channel, g[:len(g)-1]) {
+				return true
+			}
+		} else if g == channel {
+			return true
+		}
+	}
+	return false
 }
 
 type broker struct {
@@ -84,14 +145,22 @@ type broker struct {
 func NewBroker() togo.Broker { return &broker{clients: map[*client]struct{}{}} }
 
 // Publish sends to a channel's subscribers. event "channel:name" targets a
-// channel; a plain event (no ":") broadcasts to every client.
+// channel; a plain event (no ":") broadcasts to every authenticated client
+// (connections that never presented a valid ticket do not receive it).
 func (b *broker) Publish(event, data string) {
 	channel, name := splitChannel(event)
 	frame, _ := json.Marshal(map[string]string{"channel": channel, "event": name, "data": data})
 	msg := string(frame)
 	b.mu.RLock()
 	for c := range b.clients {
-		if channel == "" || c.subscribed(channel) {
+		deliver := false
+		switch {
+		case channel != "":
+			deliver = c.subscribed(channel)
+		case c.authed:
+			deliver = true
+		}
+		if deliver {
 			select {
 			case c.ch <- msg:
 			default:
@@ -114,16 +183,28 @@ type inbound struct {
 }
 
 // Handler upgrades to WebSocket. A valid ?ticket= marks the connection as
-// authenticated, permitting subscriptions to private-* channels.
+// authenticated and grants the channels (exact names or "prefix*" globs) the
+// ticket was issued for, permitting subscriptions to matching private-*
+// channels.
 func (b *broker) Handler() http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		conn, err := websocket.Accept(w, r, &websocket.AcceptOptions{InsecureSkipVerify: true})
+		opts := &websocket.AcceptOptions{}
+		if len(originPatterns) > 0 {
+			opts.OriginPatterns = originPatterns
+		}
+		conn, err := websocket.Accept(w, r, opts)
 		if err != nil {
 			return
 		}
 		defer conn.Close(websocket.StatusNormalClosure, "")
 
-		c := &client{ch: make(chan string, 32), channels: map[string]struct{}{}, authed: validTicket(r.URL.Query().Get("ticket"))}
+		authed, grants := parseTicket(r.URL.Query().Get("ticket"))
+
+		// The per-client buffer is sized for high-frequency streams (e.g. driver
+		// location updates). When it fills — a slow or stalled reader — new
+		// frames are dropped rather than blocking the broker; the client should
+		// treat gaps as expected and resync on reconnect.
+		c := &client{ch: make(chan string, 256), channels: map[string]struct{}{}, authed: authed, grants: grants}
 		b.mu.Lock()
 		b.clients[c] = struct{}{}
 		b.mu.Unlock()
@@ -164,8 +245,12 @@ func (b *broker) readLoop(ctx context.Context, conn *websocket.Conn, c *client) 
 		}
 		switch in.Action {
 		case "subscribe":
-			if strings.HasPrefix(in.Channel, "private-") && !c.authed {
-				c.ch <- `{"event":"subscription_error","data":"private channel requires a ticket"}`
+			if len(in.Channel) > maxChannelBytes {
+				c.ch <- `{"event":"subscription_error","data":"channel name too long"}`
+				continue
+			}
+			if strings.HasPrefix(in.Channel, "private-") && !c.granted(in.Channel) {
+				c.ch <- `{"event":"subscription_error","data":"private channel requires a matching ticket grant"}`
 				continue
 			}
 			c.mu.Lock()
@@ -179,31 +264,88 @@ func (b *broker) readLoop(ctx context.Context, conn *websocket.Conn, c *client) 
 	}
 }
 
-// --- tickets (HMAC-signed, short-lived) ----------------------------------
+// --- tickets (HMAC-signed, short-lived, channel-scoped) ---------------------
+
+// ticketPayload is the JSON payload embedded in every ticket: the channels it
+// grants (exact names or "prefix*" globs), its expiry (unix seconds), and a
+// nonce to keep otherwise-identical tickets from being byte-for-byte equal.
+type ticketPayload struct {
+	C []string `json:"c"`
+	E int64    `json:"e"`
+	N string   `json:"n"`
+}
 
 // IssueTicket returns a signed ticket for private-channel access. Mount it behind
 // the app's auth middleware — see MountTicket — so only authenticated users
 // receive one.
+//
+// The channels it grants come from SetTicketChannels, called with this request.
+// If SetTicketChannels was never configured, the ticket grants no private
+// channels (secure by default) and a one-time warning is logged.
 func IssueTicket(w http.ResponseWriter, r *http.Request) {
-	exp := strconv.FormatInt(time.Now().Add(60*time.Second).Unix(), 10)
-	nonce := randHex()
-	payload := nonce + "." + exp
+	ticketFnMu.RLock()
+	fn := ticketChannelFn
+	ticketFnMu.RUnlock()
+
+	var channels []string
+	if fn != nil {
+		channels = fn(r)
+	} else {
+		warnUnconfigured.Do(func() {
+			msg := "realtime-ws: SetTicketChannels is not configured — IssueTicket will grant no " +
+				"private channels. Call ws.SetTicketChannels(func(r *http.Request) []string { ... }) " +
+				"during boot to grant the caller's private-* channels (for example " +
+				"[]string{\"private-driver.\" + userID})."
+			if logger != nil {
+				logger.Warn(msg)
+			}
+		})
+	}
+	writeTicket(w, channels)
+}
+
+// IssueTicketFor writes a ticket granting exactly the given channels. Use it to
+// hand-roll ticket issuance instead of going through SetTicketChannels.
+func IssueTicketFor(w http.ResponseWriter, channels []string) {
+	writeTicket(w, channels)
+}
+
+func writeTicket(w http.ResponseWriter, channels []string) {
+	if channels == nil {
+		channels = []string{}
+	}
+	p := ticketPayload{C: channels, E: time.Now().Add(ticketTTL).Unix(), N: randHex()}
+	raw, _ := json.Marshal(p)
+	payload := base64.RawURLEncoding.EncodeToString(raw)
 	ticket := payload + "." + sign(payload)
 	w.Header().Set("Content-Type", "application/json")
 	_, _ = w.Write([]byte(`{"ticket":"` + ticket + `"}`))
 }
 
-func validTicket(ticket string) bool {
-	parts := strings.Split(ticket, ".")
-	if len(parts) != 3 {
-		return false
+// parseTicket verifies ticket and, if valid and unexpired, returns (true, its
+// granted channels). An invalid, tampered, or expired ticket returns (false, nil)
+// — the connection is treated as anonymous.
+func parseTicket(ticket string) (authed bool, grants []string) {
+	i := strings.LastIndexByte(ticket, '.')
+	if i < 0 {
+		return false, nil
 	}
-	payload, sig := parts[0]+"."+parts[1], parts[2]
+	payload, sig := ticket[:i], ticket[i+1:]
 	if subtle.ConstantTimeCompare([]byte(sig), []byte(sign(payload))) != 1 {
-		return false
+		return false, nil
 	}
-	exp, err := strconv.ParseInt(parts[1], 10, 64)
-	return err == nil && time.Now().Unix() < exp
+	raw, err := base64.RawURLEncoding.DecodeString(payload)
+	if err != nil {
+		return false, nil
+	}
+	var p ticketPayload
+	if json.Unmarshal(raw, &p) != nil {
+		return false, nil
+	}
+	if time.Now().Unix() >= p.E {
+		return false, nil
+	}
+	return true, p.C
 }
 
 func sign(payload string) string {
